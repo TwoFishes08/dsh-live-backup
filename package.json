@@ -1,0 +1,53 @@
+{
+  "name": "dsh-backup",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "DSH 对话存档与插件/配置备份：每日一备、自动覆盖、云盘同步状态与备份目录自定义",
+  "icon": "icon.svg",
+  "license": "MIT",
+  "author": "TwoFishes08",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TwoFishes08/dsh-live-backup.git"
+  },
+  "homepage": "https://github.com/TwoFishes08/dsh-live-backup#readme",
+  "bugs": {
+    "url": "https://github.com/TwoFishes08/dsh-live-backup/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "backup",
+    "cloud-drive"
+  ],
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

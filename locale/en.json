@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Backup & Cloud Sync",
+    "description": "Archives DSH conversations, workspace files, plugin and app configuration into a cloud-drive folder, and reports cloud sync status."
+  }
+}
