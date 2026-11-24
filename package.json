@@ -1,6 +1,6 @@
 {
   "name": "dsh-backup",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "description": "DSH 对话存档与插件/配置备份：每日一备、自动覆盖、云盘同步状态与备份目录自定义",
@@ -36,6 +36,7 @@
     "locale/*.json",
     "icon.svg",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "dsh": {

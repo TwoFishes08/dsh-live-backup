@@ -22,7 +22,7 @@ import os from 'node:os'
 import zlib from 'node:zlib'
 import { execFile, spawn } from 'node:child_process'
 
-const PLUGIN_VERSION = '1.0.0'
+const PLUGIN_VERSION = '1.0.1'
 const BACKUP_FOLDER_NAME = 'DeepSeek Harness备份'
 const DAY_PREFIX = 'backup-'
 const TEMP_PREFIX = '.dsh-backup-tmp-'
@@ -37,6 +37,14 @@ const PROFILE_DIR = process.env.DSH_PROFILE_DIR || path.join(DSH_HOME, 'profiles
 const STATE_DIR = path.join(DSH_HOME, 'dsh-backup')
 const SETTINGS_PATH = path.join(STATE_DIR, 'settings.json')
 const STATUS_PATH = path.join(STATE_DIR, 'status.json')
+/**
+ * Backups are assembled here first, outside the cloud folder, and only then
+ * copied into `<backupRoot>/backup-<time>`. Writing the staging tree inside the
+ * cloud root is not safe: upload clients (Huawei Cloud, OneDrive, ...) hold
+ * handles on freshly written files and their filter drivers can reject a
+ * directory rename with EPERM while the upload is in flight.
+ */
+const STAGING_ROOT = path.join(STATE_DIR, 'staging')
 
 /**
  * The HTTP API is exposed through the host `connection` service. Declaring the
@@ -563,6 +571,45 @@ async function cloudSnapshot(settings, detection) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Codes cloud-drive filter drivers and antivirus scanners return while a file
+ * or directory is briefly locked. Retried a few times instead of failing the
+ * whole backup run.
+ */
+const RETRYABLE_FS_CODES = new Set(['EPERM', 'EACCES', 'EBUSY', 'EMFILE', 'ENFILE', 'EEXIST', 'ENOTEMPTY'])
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function withRetry(operation, attempts = 5) {
+  let lastError = null
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      return await operation()
+    } catch (error) {
+      lastError = error
+      if (!RETRYABLE_FS_CODES.has(error && error.code) || attempt === attempts - 1) break
+      await sleep(150 * 2 ** attempt)
+    }
+  }
+  throw lastError
+}
+
+/** Drop staging dirs left behind by earlier runs (crash, killed process, ...). */
+async function removeStaleStaging(keepName) {
+  let entries = []
+  try {
+    entries = await fsp.readdir(STAGING_ROOT, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const entry of entries) {
+    if (entry.name === keepName) continue
+    await withRetry(() => fsp.rm(path.join(STAGING_ROOT, entry.name), { recursive: true, force: true })).catch(() => {})
+  }
+}
+
+/**
  * Recursively copy `src` into `dest`, counting files and bytes.
  * Symlinks/reparse points are skipped (cloud-drive junctions must never be
  * followed), as are excluded directory names and anything under `avoidDirs`.
@@ -625,7 +672,7 @@ async function copyTree(src, dest, options = {}) {
           continue
         }
         try {
-          await fsp.copyFile(source, target)
+          await withRetry(() => fsp.copyFile(source, target))
           stats.files += 1
           stats.bytes += stat.size
           if (onProgress) onProgress(stats)
@@ -900,11 +947,14 @@ async function runBackup(ctx, reason) {
 
   const rootBase = settings.backupRoot
   const folderName = `${DAY_PREFIX}${timeStamp(startedDate)}`
-  const tempDir = path.join(rootBase, `${TEMP_PREFIX}${process.pid}-${startedAt}`)
   const finalDir = path.join(rootBase, folderName)
+  const tempDir = path.join(STAGING_ROOT, `run-${process.pid}-${startedAt}`)
+  let stagingReady = false
+  let publishing = false
+  let published = false
 
   try {
-    await fsp.mkdir(rootBase, { recursive: true })
+    await withRetry(() => fsp.mkdir(rootBase, { recursive: true }))
 
     // Durability barrier so the copies below include the newest session events.
     setStage('flush')
@@ -920,8 +970,11 @@ async function runBackup(ctx, reason) {
     const sessions = await listSessions()
     const workspaceRoots = workspaceRootsFromSessions(sessions)
 
+    await withRetry(() => fsp.mkdir(STAGING_ROOT, { recursive: true }))
+    await removeStaleStaging(path.basename(tempDir))
     await fsp.rm(tempDir, { recursive: true, force: true })
     await fsp.mkdir(tempDir, { recursive: true })
+    stagingReady = true
 
     // 1) Conversations — every stored session of every workspace.
     setStage('conversations')
@@ -1006,10 +1059,23 @@ async function runBackup(ctx, reason) {
     await writeTextFile(path.join(tempDir, 'manifest.json'), JSON.stringify(manifest, null, 2))
     await writeTextFile(path.join(tempDir, 'README.txt'), backupReadme(manifest))
 
-    // 5) Replace today's earlier backup with this one.
+    // 5) Publish. The staged tree is copied, not renamed: cloud filter drivers
+    // reject directory renames while the target folder's files are being
+    // uploaded (EPERM on Huawei Cloud Drive), and the earlier same-day backup is
+    // only retired after the new copy is complete.
     setStage('finishing')
-    const removed = await removeStaleFolders(rootBase, path.basename(tempDir))
-    await fsp.rename(tempDir, finalDir)
+    publishing = true
+    STATE.status.progress = { files: 0, bytes: 0 }
+    await withRetry(() => fsp.rm(finalDir, { recursive: true, force: true }))
+    const publishStats = await copyTree(tempDir, finalDir, { onProgress: bumpProgress })
+    if (publishStats.errors.length > 0) {
+      const firstErrors = publishStats.errors.slice(0, 3).map((item) => `${item.path} (${item.error})`).join('; ')
+      throw new Error(`写入备份文件夹失败（${publishStats.errors.length} 个文件）：${firstErrors}`)
+    }
+    published = true
+    const removed = await removeStaleFolders(rootBase, folderName)
+    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    stagingReady = false
 
     STATE.status = {
       state: 'success',
@@ -1040,6 +1106,12 @@ async function runBackup(ctx, reason) {
       lastError: null,
     }
   } catch (error) {
+    if (!published) await fsp.rm(finalDir, { recursive: true, force: true }).catch(() => {})
+    // A failed publish keeps the staged copy so the data is still recoverable; a
+    // failure while staging only frees the space again.
+    if (stagingReady && !publishing) await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+    const kept = publishing && stagingReady ? `；本次内容已保留在本地暂存目录：${tempDir}` : ''
+    const message = error && error.message ? String(error.message) : String(error)
     STATE.status = {
       state: 'error',
       reason,
@@ -1050,9 +1122,8 @@ async function runBackup(ctx, reason) {
       durationMs: Date.now() - startedAt,
       progress: { ...STATE.status.progress },
       result: null,
-      lastError: error && error.message ? String(error.message) : String(error),
+      lastError: `${message}${kept}`,
     }
-    await fsp.rm(tempDir, { recursive: true, force: true }).catch(() => {})
   } finally {
     engine.running = false
     await persistStatus()
